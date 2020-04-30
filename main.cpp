@@ -16,6 +16,8 @@
 // limitations under the License.
 // ----------------------------------------------------------------------------
 #ifndef MBED_TEST_MODE
+#include <inttypes.h>
+#include <string>
 #include "mbed.h"
 #include "kv_config.h"
 #include "mbed-cloud-client/MbedCloudClient.h" // Required for new MbedCloudClient()
@@ -24,6 +26,15 @@
 #include "key_config_manager.h"                // Required for kcm_factory_reset
 
 #include "mbed-trace/mbed_trace.h"             // Required for mbed_trace_*
+
+
+#include "SDBlockDevice.h"
+static SDBlockDevice bd(MBED_CONF_SD_SPI_MOSI, MBED_CONF_SD_SPI_MISO, MBED_CONF_SD_SPI_CLK, MBED_CONF_SD_SPI_CS);
+
+#include "FATFileSystem.h"
+FATFileSystem fs("fs");
+
+#define FORCE_REFORMAT true
 
 // Pointers to the resources that will be created in main_application().
 static MbedCloudClient *cloud_client;
@@ -35,11 +46,11 @@ static int error_count = 0;
 const uint8_t MBED_CLOUD_DEV_ENTROPY[] = { 0xf6, 0xd6, 0xc0, 0x09, 0x9e, 0x6e, 0xf2, 0x37, 0xdc, 0x29, 0x88, 0xf1, 0x57, 0x32, 0x7d, 0xde, 0xac, 0xb3, 0x99, 0x8c, 0xb9, 0x11, 0x35, 0x18, 0xeb, 0x48, 0x29, 0x03, 0x6a, 0x94, 0x6d, 0xe8, 0x40, 0xc0, 0x28, 0xcc, 0xe4, 0x04, 0xc3, 0x1f, 0x4b, 0xc2, 0xe0, 0x68, 0xa0, 0x93, 0xe6, 0x3a };
 const int MAX_ERROR_COUNT = 5;
 
-static M2MResource* m2m_get_res;
-static M2MResource* m2m_put_res;
-static M2MResource* m2m_post_res;
-static M2MResource* m2m_deregister_res;
-static M2MResource* m2m_factory_reset_res;
+static M2MResource *m2m_get_res;
+static M2MResource *m2m_put_res;
+static M2MResource *m2m_post_res;
+static M2MResource *m2m_deregister_res;
+static M2MResource *m2m_factory_reset_res;
 static SocketAddress sa;
 
 EventQueue queue(32 * EVENTS_EVENT_SIZE);
@@ -61,17 +72,74 @@ void value_increment(void)
     value_increment_mutex.unlock();
 }
 
-void get_res_update(const char* /*object_name*/)
+void value_write(void)
+{
+    value_increment_mutex.lock();
+    uint64_t value = m2m_get_res->get_value_int();
+    value_increment_mutex.unlock();
+
+    int err;
+
+    string abs_filename = "/fs/counter_" + std::to_string(value) + ".txt";
+
+    // Open the numbers file
+    printf("Creating a new file \"%s\"... ", abs_filename.c_str());
+    FILE *f = fopen(abs_filename.c_str(), "w+");
+    printf("%s\n", (!f ? "Fail :(" : "OK"));
+    if (!f) {
+        error("error: %s (%d)\n", strerror(errno), -errno);
+        fflush(stdout);
+        return;
+    }
+
+    // Close the file which also flushes any cached writes
+    printf("Closing \"%s\"... ", abs_filename.c_str());
+    err = fclose(f);
+    printf("%s\n", (err < 0 ? "Fail :(" : "OK"));
+    if (err < 0) {
+        error("error: %s (%d)\n", strerror(errno), -errno);
+    }
+
+    // Display the root directory
+    printf("Opening the root directory... ");
+    DIR *d = opendir("/fs/");
+    printf("%s\n", (!d ? "Fail :(" : "OK"));
+    if (!d) {
+        error("error: %s (%d)\n", strerror(errno), -errno);
+    }
+
+    printf("root directory:\n");
+    while (true) {
+        struct dirent *e = readdir(d);
+        if (!e) {
+            break;
+        }
+
+        printf("    %s\n", e->d_name);
+    }
+
+    printf("Closing the root directory... ");
+    err = closedir(d);
+    printf("%s\n", (err < 0 ? "Fail :(" : "OK"));
+    if (err < 0) {
+        error("error: %s (%d)\n", strerror(errno), -errno);
+    }
+
+    fflush(stdout);
+}
+
+
+void get_res_update(const char * /*object_name*/)
 {
     printf("Counter resource set to %d\n", (int)m2m_get_res->get_value_int());
 }
 
-void put_res_update(const char* /*object_name*/)
+void put_res_update(const char * /*object_name*/)
 {
     printf("PUT update %d\n", (int)m2m_put_res->get_value_int());
 }
 
-void execute_post(void* /*arguments*/)
+void execute_post(void * /*arguments*/)
 {
     printf("POST executed\n");
 }
@@ -82,7 +150,7 @@ void deregister_client(void)
     cloud_client->close();
 }
 
-void deregister(void* /*arguments*/)
+void deregister(void * /*arguments*/)
 {
     printf("POST deregister executed\n");
     m2m_deregister_res->send_delayed_post_response();
@@ -110,7 +178,7 @@ void client_unregistered(void)
     cloud_client_running = false;
 }
 
-void factory_reset(void*)
+void factory_reset(void *)
 {
     printf("POST factory reset executed\n");
     m2m_factory_reset_res->send_delayed_post_response();
@@ -122,13 +190,13 @@ void client_error(int err)
 {
     printf("client_error(%d) -> %s\n", err, cloud_client->error_description());
     if (err == MbedCloudClient::ConnectNetworkError ||
-        err == MbedCloudClient::ConnectDnsResolvingFailed ||
-        err == MbedCloudClient::ConnectSecureConnectionFailed) {
-        if(++error_count == MAX_ERROR_COUNT) {
+            err == MbedCloudClient::ConnectDnsResolvingFailed ||
+            err == MbedCloudClient::ConnectSecureConnectionFailed) {
+        if (++error_count == MAX_ERROR_COUNT) {
             printf("Max error count %d reached, rebooting.\n\n", MAX_ERROR_COUNT);
-            ThisThread::sleep_for(1*1000);
+            ThisThread::sleep_for(1 * 1000);
             NVIC_SystemReset();
-	}
+        }
     }
 }
 
@@ -141,7 +209,7 @@ void update_progress(uint32_t progress, uint32_t total)
 void flush_stdin_buffer(void)
 {
     FileHandle *debug_console = mbed::mbed_file_handle(STDIN_FILENO);
-    while(debug_console->readable()) {
+    while (debug_console->readable()) {
         char buffer[1];
         debug_console->read(buffer, 1);
     }
@@ -178,7 +246,7 @@ int main(void)
         return -1;
     }
     status = network->get_ip_address(&sa);
-    if (status!=0) {
+    if (status != 0) {
         printf("get_ip_address failed with %d\n", status);
         return -2;
     }
@@ -266,21 +334,69 @@ int main(void)
     cloud_client->add_objects(m2m_obj_list);
     cloud_client->setup(network);
 
+    printf("Initializing the block device... ");
+    int err = bd.init();
+    printf("%s\n", (err ? "Fail :(" : "OK"));
+    if (err) {
+        error("error: %s (%d)\n", strerror(-err), err);
+    }
+
+    printf("Erasing the block device... ");
+    err = bd.erase(0, bd.size());
+    printf("%s\n", (err ? "Fail :(" : "OK"));
+    if (err) {
+        error("error: %s (%d)\n", strerror(-err), err);
+    }
+
+    printf("Deinitializing the block device... ");
+    err = bd.deinit();
+    printf("%s\n", (err ? "Fail :(" : "OK"));
+    if (err) {
+        error("error: %s (%d)\n", strerror(-err), err);
+    }
+
+    printf("Mounting the filesystem... ");
+    err = fs.mount(&bd);
+    printf("%s\n", (err ? "Fail :(" : "OK"));
+    if (err || FORCE_REFORMAT) {
+        // Reformat if we can't mount the filesystem
+        printf("formatting... ");
+        err = fs.reformat(&bd);
+        printf("%s\n", (err ? "Fail :(" : "OK"));
+        if (err) {
+            error("error: %s (%d)\n", strerror(-err), err);
+            return -1;
+        }
+    }
     t.start(callback(&queue, &EventQueue::dispatch_forever));
     queue.call_every(5000, value_increment);
 
     // Flush the stdin buffer before reading from it
     flush_stdin_buffer();
 
-    while(cloud_client_running) {
+    while (cloud_client_running) {
         int in_char = getchar();
         if (in_char == 'i') {
             print_client_ids(); // When 'i' is pressed, print endpoint info
             continue;
+        } else if (in_char == 'w') {
+            value_write(); // When 'w' is pressed, write counter value to a file
+            continue;
         } else if (in_char == 'r') {
             (void) fcc_storage_delete(); // When 'r' is pressed, erase storage and reboot the board.
             printf("Storage erased, rebooting the device.\n\n");
-            ThisThread::sleep_for(1*1000);
+            ThisThread::sleep_for(1 * 1000);
+            NVIC_SystemReset();
+        } else if (in_char == 's') { // When 's' is pressed, shutdown(reboot) the board.
+            printf("Unmounting... ");
+            int err = fs.unmount();
+            printf("%s\n", (err < 0 ? "Fail :(" : "OK"));
+            if (err < 0) {
+                error("error: %s (%d)\n", strerror(-err), err);
+            }
+            printf("Rebooting the device.\n\n");
+            fflush(stdout);
+            ThisThread::sleep_for(1 * 1000);
             NVIC_SystemReset();
         } else if (in_char > 0 && in_char != 0x03) { // Ctrl+C is 0x03 in Mbed OS and Linux returns negative number
             value_increment(); // Simulate button press
